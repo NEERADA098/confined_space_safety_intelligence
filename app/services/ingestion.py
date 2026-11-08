@@ -1,4 +1,3 @@
-
 from enum import Enum
 from uuid import UUID
 
@@ -27,7 +26,6 @@ class InMemoryTelemetryStore:
         existing = self._events.get(reading.event_id)
 
         if existing is not None:
-
             if existing == reading:
                 return IngestionResult.DUPLICATE
 
@@ -36,16 +34,16 @@ class InMemoryTelemetryStore:
             )
 
         self._events[reading.event_id] = reading
-
         return IngestionResult.ACCEPTED
 
     def get_all(self) -> list[TelemetryReading]:
-
         return list(self._events.values())
 
     def get_count(self) -> int:
-
         return len(self._events)
+
+    def get_by_id(self, event_id: UUID) -> TelemetryReading | None:
+        return self._events.get(event_id)
 
 
 telemetry_store = InMemoryTelemetryStore()
