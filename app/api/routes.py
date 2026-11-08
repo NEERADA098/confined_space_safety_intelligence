@@ -7,11 +7,10 @@ from pydantic import BaseModel
 from app.schemas.assessment import HazardAssessment
 from app.schemas.telemetry import TelemetryReading
 from app.services.hazard_detection import assess_telemetry
-from app.services.ingestion import (
+from app.services.sqlite_store import (
     EventConflictError,
     IngestionResult,
-    InMemoryTelemetryStore,
-    telemetry_store,
+    SQLiteTelemetryStore,
 )
 
 
@@ -21,12 +20,16 @@ router = APIRouter(
 )
 
 
-def get_telemetry_store() -> InMemoryTelemetryStore:
+# One shared store instance, backed by the persistent SQLite database.
+telemetry_store = SQLiteTelemetryStore()
+
+
+def get_telemetry_store() -> SQLiteTelemetryStore:
     return telemetry_store
 
 
 StoreDependency = Annotated[
-    InMemoryTelemetryStore,
+    SQLiteTelemetryStore,
     Depends(get_telemetry_store),
 ]
 
@@ -71,10 +74,21 @@ def get_telemetry(
     limit: int = Query(default=100, ge=1, le=1000),
 ):
     readings = store.get_all()
+
     return {
         "count": len(readings),
         "readings": readings[-limit:],
     }
+
+
+@router.get(
+    "/integrity",
+    tags=["Audit Integrity"],
+)
+def get_audit_integrity(
+    store: StoreDependency,
+):
+    return store.verify_chain()
 
 
 @router.get(
