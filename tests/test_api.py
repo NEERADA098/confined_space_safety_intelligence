@@ -157,3 +157,23 @@ def test_telemetry_survives_store_recreation(api_client):
     assert recreated_store.get_by_id(
         UUID(payload["event_id"])
     ) is not None
+
+
+def test_telemetry_pagination_returns_latest_records_and_total_count(api_client):
+    client, _ = api_client
+    payloads = [make_payload() for _ in range(4)]
+
+    for payload in payloads:
+        response = client.post("/api/v1/telemetry", json=payload)
+        assert response.status_code == 202
+
+    response = client.get("/api/v1/telemetry?limit=2")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 4
+    assert len(body["readings"]) == 2
+    assert [item["event_id"] for item in body["readings"]] == [
+        payloads[2]["event_id"],
+        payloads[3]["event_id"],
+    ]

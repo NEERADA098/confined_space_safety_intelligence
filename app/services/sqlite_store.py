@@ -190,19 +190,24 @@ class SQLiteTelemetryStore:
         finally:
             connection.close()
 
-    def get_all(self) -> list[TelemetryReading]:
+    def get_all(self, limit: int | None = None) -> list[TelemetryReading]:
+        query = (
+            "SELECT payload_json FROM telemetry_events "
+            "ORDER BY sequence_id DESC"
+        )
+        parameters = ()
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be at least 1")
+            query += " LIMIT ?"
+            parameters = (limit,)
+
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                """
-                SELECT payload_json
-                FROM telemetry_events
-                ORDER BY sequence_id ASC
-                """
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
 
         return [
             TelemetryReading.model_validate_json(row["payload_json"])
-            for row in rows
+            for row in reversed(rows)
         ]
 
     def get_count(self) -> int:

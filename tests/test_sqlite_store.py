@@ -123,3 +123,29 @@ def test_payload_tampering_is_detected(store):
 def test_in_memory_database_is_rejected():
     with pytest.raises(ValueError, match="In-memory SQLite databases are unsupported"):
         SQLiteTelemetryStore(":memory:")
+
+
+def test_get_all_with_limit_returns_latest_records_in_chronological_order(store):
+    readings = [make_reading() for _ in range(4)]
+    for reading in readings:
+        store.ingest(reading)
+
+    result = store.get_all(limit=2)
+
+    assert [item.event_id for item in result] == [
+        readings[2].event_id,
+        readings[3].event_id,
+    ]
+
+
+def test_get_all_without_limit_returns_all_records(store):
+    readings = [make_reading() for _ in range(3)]
+    for reading in readings:
+        store.ingest(reading)
+
+    assert store.get_all() == readings
+
+
+def test_get_all_rejects_limit_below_one(store):
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        store.get_all(limit=0)

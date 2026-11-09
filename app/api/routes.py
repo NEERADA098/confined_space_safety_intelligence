@@ -73,11 +73,11 @@ def get_telemetry(
     store: StoreDependency,
     limit: int = Query(default=100, ge=1, le=1000),
 ):
-    readings = store.get_all()
+    readings = store.get_all(limit=limit)
 
     return {
-        "count": len(readings),
-        "readings": readings[-limit:],
+        "count": store.get_count(),
+        "readings": readings,
     }
 
 
