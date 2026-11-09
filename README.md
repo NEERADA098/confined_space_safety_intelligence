@@ -1,5 +1,7 @@
 # Confined-Space Safety Intelligence & Incident Logging Platform
 
+[![Python CI](https://github.com/NEERADA098/confined_space_safety_intelligence/actions/workflows/ci.yml/badge.svg)](https://github.com/NEERADA098/confined_space_safety_intelligence/actions/workflows/ci.yml)
+
 A Python backend prototype for receiving confined-space sensor telemetry, detecting potential atmospheric hazards, and maintaining a persistent, hash-chained audit log.
 
 > **Safety disclaimer:** This is a prototype using simulated telemetry. It is not certified, field-validated, or suitable for authorizing confined-space entry. It does not replace calibrated gas detectors, competent personnel, permits, or established safety procedures. A NORMAL assessment only means no configured threshold was crossed in the evaluated reading.
@@ -279,7 +281,7 @@ Latest local verification: **55 tests passed**.
 
 ---
 
-**Project status:** Phases 1–7 — telemetry ingestion, explainable hazard detection, persistent storage, audit-chain integrity, checkpoint recovery, concurrency, and failure-recovery hardening; Phase 8 — containerization, operational health checks, and CI workflow configuration (hosted run pending).
+**Project status:** Phases 1–7 — telemetry ingestion, explainable hazard detection, persistent storage, audit-chain integrity, checkpoint recovery, concurrency, and failure-recovery hardening; Phase 8 — containerization, operational health checks, and GitHub Actions CI (hosted workflow passed).
 
 ### Operational Health Checks
 
