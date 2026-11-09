@@ -393,6 +393,74 @@ class SQLiteTelemetryStore:
 
         return row["total"]
 
+    def check_readiness(self) -> dict:
+        """
+        Check database access and checkpoint/head agreement.
+
+        This deliberately does not scan the complete hash chain.
+        Full historical integrity verification remains verify_chain().
+        """
+        with closing(self._connect()) as connection:
+            # Serialize this snapshot against ingestion, which updates the
+            # checkpoint before committing its SQLite transaction.
+            connection.execute("BEGIN IMMEDIATE")
+
+            row = connection.execute(
+                """
+                SELECT sequence_id, record_hash
+                FROM telemetry_events
+                ORDER BY sequence_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+            chain_head = (
+                {
+                    "sequence_id": row["sequence_id"],
+                    "record_hash": row["record_hash"],
+                }
+                if row is not None
+                else {
+                    "sequence_id": 0,
+                    "record_hash": self.GENESIS_HASH,
+                }
+            )
+
+            try:
+                checkpoint = self._read_checkpoint()
+            except (OSError, ValueError) as exc:
+                return {
+                    "ready": False,
+                    "database": "available",
+                    "checkpoint": "invalid",
+                    "reason": str(exc),
+                }
+
+            if checkpoint is None:
+                return {
+                    "ready": False,
+                    "database": "available",
+                    "checkpoint": "missing",
+                    "reason": "Checkpoint is missing",
+                }
+
+            matches_head = (
+                checkpoint["sequence_id"] == chain_head["sequence_id"]
+                and checkpoint["record_hash"] == chain_head["record_hash"]
+            )
+
+            return {
+                "ready": matches_head,
+                "database": "available",
+                "checkpoint": "valid" if matches_head else "mismatch",
+                "sequence_id": chain_head["sequence_id"],
+                "reason": (
+                    None
+                    if matches_head
+                    else "Checkpoint does not match the current database head"
+                ),
+            }
+
     def get_by_id(self, event_id: UUID) -> TelemetryReading | None:
         with closing(self._connect()) as connection:
             row = connection.execute(

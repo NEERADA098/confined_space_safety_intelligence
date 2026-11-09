@@ -1,0 +1,27 @@
+services:
+  telemetry-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: confined-space-telemetry-api
+    ports:
+      - "8000:8000"
+    environment:
+      TELEMETRY_DATABASE_PATH: ${TELEMETRY_DATABASE_PATH:-/data/telemetry.db}
+      TELEMETRY_CHECKPOINT_PATH: ${TELEMETRY_CHECKPOINT_PATH:-/data/telemetry.db.audit-checkpoint.json}
+    volumes:
+      - telemetry_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  telemetry_data:

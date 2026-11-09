@@ -49,6 +49,49 @@ def test_health_endpoint(api_client):
     assert response.json()["status"] == "healthy"
 
 
+def test_readiness_endpoint(api_client):
+    client, _ = api_client
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["database"] == "available"
+    assert body["checkpoint"] == "valid"
+    assert body["ready"] is True
+
+
+def test_readiness_fails_when_checkpoint_is_missing(api_client):
+    client, store = api_client
+    store.checkpoint_path.unlink()
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["status"] == "not_ready"
+    assert response.json()["detail"]["checkpoint"] == "missing"
+
+
+def test_readiness_fails_when_checkpoint_does_not_match_database(api_client):
+    client, store = api_client
+
+    client.post("/api/v1/telemetry", json=make_payload())
+
+    checkpoint = store._read_checkpoint()
+    checkpoint["sequence_id"] = 0
+    checkpoint["record_hash"] = store.GENESIS_HASH
+    store.checkpoint_path.write_text(
+        __import__("json").dumps(checkpoint),
+        encoding="utf-8",
+    )
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["checkpoint"] == "mismatch"
+
+
 def test_new_telemetry_is_accepted(api_client):
     client, _ = api_client
 

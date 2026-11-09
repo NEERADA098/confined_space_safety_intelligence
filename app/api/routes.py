@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 from uuid import UUID
 
@@ -13,6 +14,9 @@ from app.services.sqlite_store import (
     IngestionResult,
     SQLiteTelemetryStore,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(
@@ -53,15 +57,31 @@ def ingest_telemetry(
     try:
         result = store.ingest(reading)
     except EventConflictError as exc:
+        logger.warning(
+            "telemetry_ingestion_conflict event_id=%s reason=%s",
+            reading.event_id,
+            str(exc),
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
     except CheckpointError as exc:
+        logger.error(
+            "telemetry_ingestion_checkpoint_failure event_id=%s reason=%s",
+            reading.event_id,
+            str(exc),
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
+
+    logger.info(
+        "telemetry_ingestion_completed event_id=%s result=%s",
+        reading.event_id,
+        result.value,
+    )
 
     return IngestionResponse(
         event_id=str(reading.event_id),

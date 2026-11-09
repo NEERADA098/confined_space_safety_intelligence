@@ -81,7 +81,8 @@ Base path: `/api/v1`
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/health` | Application health check |
+| GET | `/health` | Application liveness check |
+| GET | `/ready` | Database and checkpoint readiness check |
 | POST | `/api/v1/telemetry` | Submit a telemetry event |
 | GET | `/api/v1/telemetry` | Retrieve stored telemetry events |
 | GET | `/api/v1/telemetry/integrity` | Verify audit-chain integrity |
@@ -166,6 +167,55 @@ The checkpoint is a separate local file, not an external trust anchor. An actor 
 
 Local database files are excluded from Git.
 
+## Container Deployment
+
+Docker Compose provides a containerized API deployment with a persistent
+named volume for the SQLite database and its audit-checkpoint sidecar.
+
+### Configure deployment
+
+Copy the example environment file:
+
+    cp .env.example .env
+
+The default container paths are:
+
+- `TELEMETRY_DATABASE_PATH=/data/telemetry.db`
+- `TELEMETRY_CHECKPOINT_PATH=/data/telemetry.db.audit-checkpoint.json`
+
+Both files must remain on the persistent `/data` volume. If changing either
+path, ensure the destination is writable by the non-root application user
+and backed by persistent storage.
+
+### Build and start
+
+    docker compose config
+    docker compose up -d --build
+
+Check container status and application health:
+
+    docker compose ps
+    curl http://localhost:8000/health
+    curl http://localhost:8000/ready
+
+Interactive API documentation:
+
+    http://localhost:8000/docs
+
+### Stop and restart
+
+    docker compose stop
+    docker compose start
+
+The named `telemetry_data` volume retains database and checkpoint files
+across container recreation and ordinary restarts. Do not use
+`docker compose down -v` unless intentional permanent deletion of that
+volume and its data is required.
+
+`/health` reports application liveness; `/ready` checks database and
+checkpoint readiness. Neither endpoint certifies sensor operation,
+full audit integrity, or confined-space safety.
+
 ## Testing
 
 | Test module | Coverage |
@@ -174,7 +224,7 @@ Local database files are excluded from Git.
 | `tests/test_sqlite_store.py` | Persistence, duplicate handling, conflicts, hash-chain integrity, concurrency, and recovery |
 | `tests/test_api.py` | API ingestion, retrieval, assessment, integrity, and persistence |
 
-Latest verified result after documentation and formatting cleanup: **52 tests passed**.
+Latest local verification: **55 tests passed**.
 
 ## Current Limitations
 
@@ -194,7 +244,7 @@ Latest verified result after documentation and formatting cleanup: **52 tests pa
 - Add a monitoring dashboard and alert delivery.
 - Add authentication, authorization, and operational security controls.
 - Introduce externally anchored audit checkpoints.
-- Add deployment and containerization support.
+- Expand deployment and operational monitoring hardening.
 - Conduct controlled validation against applicable safety requirements.
 
 ## Repository Structure
@@ -216,10 +266,30 @@ Latest verified result after documentation and formatting cleanup: **52 tests pa
     │   ├── test_api.py
     │   ├── test_hazard_detection.py
     │   └── test_sqlite_store.py
+    ├── .github/
+    │   └── workflows/
+    │       └── ci.yml
+    ├── Dockerfile
+    ├── compose.yaml
+    ├── .dockerignore
+    ├── .env.example
     ├── requirements.txt
     ├── requirements-dev.txt
     └── .gitignore
 
 ---
 
-**Project status:** Phase 1 — telemetry ingestion; Phase 2 — explainable hazard detection; Phase 3 — SQLite persistence and hash-chained audit logging; Phase 4 — database-level pagination; Phase 5 — audit-chain integrity edge-case tests; Phase 6 — local audit-checkpoint sidecar and explicit recovery; Phase 7 — transaction consistency, concurrency testing, and failure-recovery hardening.
+**Project status:** Phases 1–7 — telemetry ingestion, explainable hazard detection, persistent storage, audit-chain integrity, checkpoint recovery, concurrency, and failure-recovery hardening; Phase 8 — containerization, operational health checks, and CI workflow configuration (hosted run pending).
+
+### Operational Health Checks
+
+- `GET /health` is a liveness check. It confirms that the API process responds.
+- `GET /ready` checks SQLite availability and whether the audit checkpoint
+  matches the current database head. Docker Compose uses this endpoint.
+- `GET /api/v1/telemetry/integrity` performs the full historical hash-chain
+  and checkpoint verification. This is more expensive as the event history
+  grows, so it is kept separate from routine container health probes.
+
+Readiness does not prove that every historical record is untampered. A
+successful readiness response is not a safety certification or authorization
+to enter a confined space.
