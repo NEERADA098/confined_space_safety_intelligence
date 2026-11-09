@@ -1,5 +1,7 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from threading import Event, get_ident
 from uuid import uuid4
 
 import pytest
@@ -356,4 +358,223 @@ def test_checkpoint_write_failure_rolls_back_ingestion(
 
     assert store.get_count() == 0
     assert store.checkpoint_path.read_bytes() == original_checkpoint
+    assert store.verify_chain()["valid"] is True
+
+
+def test_concurrent_ingestion_preserves_audit_integrity(store):
+    readings = [make_reading() for _ in range(8)]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(store.ingest, readings))
+
+    assert all(
+        result == IngestionResult.ACCEPTED
+        for result in results
+    )
+    assert store.get_count() == 8
+
+    integrity = store.verify_chain()
+
+    assert integrity["valid"] is True
+    assert integrity["records_checked"] == 8
+
+
+def test_concurrent_ingestion_across_store_instances(tmp_path):
+    database_path = tmp_path / "shared.db"
+    checkpoint_path = tmp_path / "shared.audit-checkpoint.json"
+
+    first_store = SQLiteTelemetryStore(
+        database_path,
+        checkpoint_path,
+    )
+    second_store = SQLiteTelemetryStore(
+        database_path,
+        checkpoint_path,
+    )
+
+    readings = [make_reading() for _ in range(8)]
+    stores = [first_store, second_store] * 4
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda pair: pair[0].ingest(pair[1]),
+                zip(stores, readings),
+            )
+        )
+
+    assert all(
+        result == IngestionResult.ACCEPTED
+        for result in results
+    )
+    assert first_store.get_count() == 8
+
+    integrity = second_store.verify_chain()
+
+    assert integrity["valid"] is True
+    assert integrity["records_checked"] == 8
+
+
+def test_sqlite_connection_uses_full_synchronous_mode(store):
+    connection = store._connect()
+
+    try:
+        synchronous = connection.execute(
+            "PRAGMA synchronous"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    # SQLite reports 2 for FULL synchronous mode.
+    assert synchronous == 2
+
+
+def test_integrity_verification_waits_for_checkpoint_update(
+    store,
+    monkeypatch,
+):
+    reading = make_reading()
+
+    checkpoint_started = Event()
+    allow_checkpoint = Event()
+    verification_lock_attempted = Event()
+    verification_lock_acquired = Event()
+
+    original_write_checkpoint = store._write_checkpoint
+    original_connect = store._connect
+    verification_thread_id = None
+
+    def delayed_checkpoint(chain_head):
+        checkpoint_started.set()
+
+        if not allow_checkpoint.wait(timeout=5):
+            raise TimeoutError("Test checkpoint release timed out")
+
+        original_write_checkpoint(chain_head)
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, parameters=()):
+            is_verification_lock = (
+                get_ident() == verification_thread_id
+                and sql.strip().upper() == "BEGIN IMMEDIATE"
+            )
+
+            if is_verification_lock:
+                verification_lock_attempted.set()
+
+            result = self._connection.execute(sql, parameters)
+
+            if is_verification_lock:
+                verification_lock_acquired.set()
+
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def tracking_connect():
+        connection = original_connect()
+
+        if get_ident() == verification_thread_id:
+            return ConnectionProxy(connection)
+
+        return connection
+
+    monkeypatch.setattr(
+        store,
+        "_write_checkpoint",
+        delayed_checkpoint,
+    )
+    monkeypatch.setattr(store, "_connect", tracking_connect)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        ingestion_future = executor.submit(store.ingest, reading)
+
+        assert checkpoint_started.wait(timeout=5)
+
+        def run_verification():
+            nonlocal verification_thread_id
+            verification_thread_id = get_ident()
+            return store.verify_chain()
+
+        verification_future = executor.submit(run_verification)
+
+        # Verification has reached the SQLite lock request.
+        assert verification_lock_attempted.wait(timeout=5)
+
+        # SQLite must not grant the writer lock while ingestion is paused
+        # after writing its checkpoint but before committing its transaction.
+        assert verification_lock_acquired.wait(timeout=0.2) is False
+
+        allow_checkpoint.set()
+
+        assert ingestion_future.result(timeout=10) == (
+            IngestionResult.ACCEPTED
+        )
+
+        # Once ingestion commits and releases its lock, verification proceeds.
+        assert verification_lock_acquired.wait(timeout=5)
+
+        integrity = verification_future.result(timeout=10)
+
+    assert integrity["valid"] is True
+    assert integrity["records_checked"] == 1
+
+
+def test_sqlite_commit_failure_requires_explicit_checkpoint_recovery(
+    store,
+    monkeypatch,
+):
+    reading = make_reading()
+
+    original_connect = store._connect
+    fail_commit = True
+
+    class CommitFailingConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def commit(self):
+            nonlocal fail_commit
+
+            if fail_commit:
+                fail_commit = False
+                raise sqlite3.OperationalError(
+                    "Simulated SQLite commit failure"
+                )
+
+            return self.connection.commit()
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        lambda: CommitFailingConnection(original_connect()),
+    )
+
+    with pytest.raises(CheckpointError, match="SQLite commit failed"):
+        store.ingest(reading)
+
+    monkeypatch.setattr(store, "_connect", original_connect)
+
+    # The database transaction rolled back, but the checkpoint was replaced.
+    assert store.get_count() == 0
+
+    integrity = store.verify_chain()
+    assert integrity["valid"] is False
+    assert any(
+        "Checkpoint does not match" in error
+        for error in integrity["errors"]
+    )
+
+    # Recovery must be explicit and must trust the verified database head.
+    recovery = store.establish_checkpoint()
+
+    assert recovery["established"] is True
+    assert recovery["sequence_id"] == 0
     assert store.verify_chain()["valid"] is True

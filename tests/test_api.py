@@ -177,3 +177,31 @@ def test_telemetry_pagination_returns_latest_records_and_total_count(api_client)
         payloads[2]["event_id"],
         payloads[3]["event_id"],
     ]
+
+def test_checkpoint_failure_returns_503_without_persisting_event(
+    api_client,
+    monkeypatch,
+):
+    client, store = api_client
+    payload = make_payload()
+
+    def fail_checkpoint(_chain_head):
+        raise OSError("Simulated checkpoint write failure")
+
+    monkeypatch.setattr(store, "_write_checkpoint", fail_checkpoint)
+
+    response = client.post(
+        "/api/v1/telemetry",
+        json=payload,
+    )
+
+    assert response.status_code == 503
+    assert "checkpoint" in response.json()["detail"].lower()
+    assert store.get_count() == 0
+
+    # The failed ingestion must leave the original checkpoint and chain valid.
+    integrity_response = client.get("/api/v1/telemetry/integrity")
+
+    assert integrity_response.status_code == 200
+    assert integrity_response.json()["valid"] is True
+    assert integrity_response.json()["records_checked"] == 0

@@ -93,6 +93,7 @@ Base path: `/api/v1`
 - `202 Accepted` — Identical duplicate event ignored.
 - `409 Conflict` — An existing event ID was submitted with different content.
 - `422 Unprocessable Entity` — Request payload failed validation.
+- `503 Service Unavailable` — Audit verification or checkpoint persistence failed; ingestion was not confirmed. Reconcile the event and audit state before retrying.
 
 The telemetry retrieval endpoint supports a `limit` query parameter, defaulting to 100 and allowing values from 1 to 1000.
 
@@ -141,7 +142,7 @@ Interactive documentation: `http://127.0.0.1:8000/docs`.
 
     python -m pytest -v
 
-The current test suite contains 46 tests covering hazard detection, SQLite persistence, audit-chain integrity, and API integration.
+The test suite covers hazard detection, SQLite persistence, audit-chain integrity, concurrency, failure recovery, and API integration.
 
 ## Database and Audit Integrity
 
@@ -157,7 +158,7 @@ The application also maintains a local JSON audit-checkpoint sidecar containing 
 
 A new empty database receives a genesis checkpoint. A non-empty database with a missing checkpoint requires explicit trust establishment through `establish_checkpoint()`; it is never silently adopted.
 
-The checkpoint is updated before the SQLite transaction commits, while the SQLite writer lock is held. If the database and checkpoint become inconsistent, integrity verification fails closed and ingestion is blocked until explicit checkpoint recovery.
+The checkpoint is updated before the SQLite transaction commits, while the SQLite writer lock is held. If the database and checkpoint become inconsistent, integrity verification fails closed and ingestion is blocked until explicit checkpoint recovery. SQLite connections use a 30-second lock timeout and explicitly request FULL synchronous mode. Integrity verification and ingestion serialize through SQLite's writer lock. Each ingestion currently verifies the complete chain, so verification cost grows with the number of stored events; repeated ingestion therefore has quadratic cumulative verification work. This is a deliberate integrity-first prototype trade-off, not a high-throughput design.
 
 The checkpoint is a separate local file, not an external trust anchor. An actor with sufficient access to both files could rewrite the database and checkpoint. Stronger audit guarantees require separately controlled remote or immutable checkpoint storage, signatures, and access controls.
 
@@ -170,10 +171,10 @@ Local database files are excluded from Git.
 | Test module | Coverage |
 |---|---|
 | `tests/test_hazard_detection.py` | Hazard thresholds, sensor faults, stale readings, and multiple hazards |
-| `tests/test_sqlite_store.py` | Persistence, duplicate handling, conflicts, and hash-chain integrity |
+| `tests/test_sqlite_store.py` | Persistence, duplicate handling, conflicts, hash-chain integrity, concurrency, and recovery |
 | `tests/test_api.py` | API ingestion, retrieval, assessment, integrity, and persistence |
 
-Latest verified result: **46 tests passed**. The suite will be rerun before the next commit.
+Latest verified result after documentation and formatting cleanup: **52 tests passed**.
 
 ## Current Limitations
 
@@ -221,4 +222,4 @@ Latest verified result: **46 tests passed**. The suite will be rerun before the 
 
 ---
 
-**Project status:** Phase 1 — telemetry ingestion; Phase 2 — explainable hazard detection; Phase 3 — SQLite persistence and hash-chained audit logging; Phase 4 — database-level pagination; Phase 5 — audit-chain integrity edge-case tests; Phase 6 — local audit-checkpoint sidecar and explicit recovery.
+**Project status:** Phase 1 — telemetry ingestion; Phase 2 — explainable hazard detection; Phase 3 — SQLite persistence and hash-chained audit logging; Phase 4 — database-level pagination; Phase 5 — audit-chain integrity edge-case tests; Phase 6 — local audit-checkpoint sidecar and explicit recovery; Phase 7 — transaction consistency, concurrency testing, and failure-recovery hardening.

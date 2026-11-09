@@ -77,6 +77,7 @@ class SQLiteTelemetryStore:
             str(self.database_path),
             timeout=30,
         )
+        connection.execute("PRAGMA synchronous = FULL")
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -265,7 +266,10 @@ class SQLiteTelemetryStore:
                     "Event ID already exists with different content"
                 )
 
-            integrity = self.verify_chain()
+            chain_result = self._verify_hash_chain_with_connection(
+                connection
+            )
+            integrity = self._build_integrity_result(chain_result)
 
             if not integrity["valid"]:
                 raise CheckpointError(
@@ -407,18 +411,21 @@ class SQLiteTelemetryStore:
             row["payload_json"]
         )
 
-    def _verify_hash_chain(self) -> dict:
+    def _verify_hash_chain_with_connection(
+        self,
+        connection: sqlite3.Connection,
+    ) -> dict:
+        """Verify the complete hash chain using the supplied connection."""
         errors = []
 
-        with closing(self._connect()) as connection:
-            rows = connection.execute(
-                """
-                SELECT sequence_id, event_id, payload_json,
-                       received_at, previous_hash, record_hash
-                FROM telemetry_events
-                ORDER BY sequence_id ASC
-                """
-            ).fetchall()
+        rows = connection.execute(
+            """
+            SELECT sequence_id, event_id, payload_json,
+                   received_at, previous_hash, record_hash
+            FROM telemetry_events
+            ORDER BY sequence_id ASC
+            """
+        ).fetchall()
 
         expected_previous_hash = self.GENESIS_HASH
 
@@ -472,50 +479,8 @@ class SQLiteTelemetryStore:
             "chain_head": chain_head,
         }
 
-    def establish_checkpoint(self) -> dict:
-        """Explicitly trust the current head of a verified hash chain."""
-        connection = self._connect()
-
-        try:
-            # Prevent concurrent ingestion while verifying and writing
-            # the replacement checkpoint.
-            connection.execute("BEGIN IMMEDIATE")
-
-            chain_result = self._verify_hash_chain()
-
-            if not chain_result["valid"]:
-                raise CheckpointError(
-                    "Cannot establish checkpoint because the hash chain "
-                    "is invalid: "
-                    + "; ".join(chain_result["errors"])
-                )
-
-            chain_head = chain_result["chain_head"]
-
-            try:
-                self._write_checkpoint(chain_head)
-            except OSError as exc:
-                raise CheckpointError(
-                    "Could not write the audit checkpoint"
-                ) from exc
-
-            connection.commit()
-
-            return {
-                "established": True,
-                "sequence_id": chain_head["sequence_id"],
-                "record_hash": chain_head["record_hash"],
-            }
-
-        except Exception:
-            connection.rollback()
-            raise
-
-        finally:
-            connection.close()
-
-    def verify_chain(self) -> dict:
-        chain_result = self._verify_hash_chain()
+    def _build_integrity_result(self, chain_result: dict) -> dict:
+        """Compare a verified database chain head with its checkpoint."""
         errors = list(chain_result["errors"])
         chain_head = chain_result["chain_head"]
 
@@ -560,3 +525,68 @@ class SQLiteTelemetryStore:
             "errors": errors,
             "checkpoint": checkpoint_status,
         }
+
+    def establish_checkpoint(self) -> dict:
+        """Explicitly trust the current head of a verified hash chain."""
+        connection = self._connect()
+
+        try:
+            # Serialize recovery against ingestion and integrity verification.
+            connection.execute("BEGIN IMMEDIATE")
+
+            chain_result = self._verify_hash_chain_with_connection(
+                connection
+            )
+
+            if not chain_result["valid"]:
+                raise CheckpointError(
+                    "Cannot establish checkpoint because the hash chain "
+                    "is invalid: "
+                    + "; ".join(chain_result["errors"])
+                )
+
+            chain_head = chain_result["chain_head"]
+
+            try:
+                self._write_checkpoint(chain_head)
+            except Exception as exc:
+                raise CheckpointError(
+                    "Could not write the audit checkpoint"
+                ) from exc
+
+            connection.commit()
+
+            return {
+                "established": True,
+                "sequence_id": chain_head["sequence_id"],
+                "record_hash": chain_head["record_hash"],
+            }
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        finally:
+            connection.close()
+
+    def verify_chain(self) -> dict:
+        """Verify database records and checkpoint under one writer lock."""
+        connection = self._connect()
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+
+            chain_result = self._verify_hash_chain_with_connection(
+                connection
+            )
+            integrity = self._build_integrity_result(chain_result)
+
+            connection.commit()
+            return integrity
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        finally:
+            connection.close()
