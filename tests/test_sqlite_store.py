@@ -149,3 +149,63 @@ def test_get_all_without_limit_returns_all_records(store):
 def test_get_all_rejects_limit_below_one(store):
     with pytest.raises(ValueError, match="limit must be at least 1"):
         store.get_all(limit=0)
+
+
+def test_deleting_middle_record_is_detected(store):
+    readings = [make_reading() for _ in range(3)]
+    for reading in readings:
+        store.ingest(reading)
+
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "DELETE FROM telemetry_events WHERE event_id = ?",
+            (str(readings[1].event_id),),
+        )
+
+    result = store.verify_chain()
+
+    assert result["valid"] is False
+    assert result["records_checked"] == 2
+    assert any("Sequence discontinuity" in error for error in result["errors"])
+    assert any("Previous-hash mismatch" in error for error in result["errors"])
+
+
+def test_deleting_final_record_is_not_detected_without_checkpoint(store):
+    readings = [make_reading() for _ in range(3)]
+    for reading in readings:
+        store.ingest(reading)
+
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "DELETE FROM telemetry_events WHERE event_id = ?",
+            (str(readings[2].event_id),),
+        )
+
+    result = store.verify_chain()
+
+    assert result["valid"] is True
+    assert result["records_checked"] == 2
+
+
+def test_empty_audit_chain_is_valid(store):
+    result = store.verify_chain()
+
+    assert result["valid"] is True
+    assert result["records_checked"] == 0
+    assert result["errors"] == []
+
+
+def test_received_at_tampering_is_detected(store):
+    reading = make_reading()
+    store.ingest(reading)
+
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE telemetry_events SET received_at = ? WHERE event_id = ?",
+            ("2099-01-01T00:00:00+00:00", str(reading.event_id)),
+        )
+
+    result = store.verify_chain()
+
+    assert result["valid"] is False
+    assert any("Record hash mismatch" in error for error in result["errors"])
