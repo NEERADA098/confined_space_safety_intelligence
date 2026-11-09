@@ -8,6 +8,7 @@ from app.schemas.assessment import HazardAssessment
 from app.schemas.telemetry import TelemetryReading
 from app.services.hazard_detection import assess_telemetry
 from app.services.sqlite_store import (
+    CheckpointError,
     EventConflictError,
     IngestionResult,
     SQLiteTelemetryStore,
@@ -54,6 +55,11 @@ def ingest_telemetry(
     except EventConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except CheckpointError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
 

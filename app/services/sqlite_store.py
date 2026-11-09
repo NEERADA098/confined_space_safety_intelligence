@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import tempfile
 from contextlib import closing
 from datetime import datetime, timezone
 from enum import Enum
@@ -21,10 +22,19 @@ class EventConflictError(Exception):
     pass
 
 
+class CheckpointError(RuntimeError):
+    pass
+
+
 class SQLiteTelemetryStore:
     GENESIS_HASH = "0" * 64
 
-    def __init__(self, database_path: str | Path | None = None):
+
+    def __init__(
+        self,
+        database_path: str | Path | None = None,
+        checkpoint_path: str | Path | None = None,
+    ):
         if database_path is None:
             project_root = Path(__file__).resolve().parents[2]
             database_path = os.getenv(
@@ -40,12 +50,27 @@ class SQLiteTelemetryStore:
             )
 
         self.database_path = Path(database_path)
+
+        if checkpoint_path is None:
+            checkpoint_path = os.getenv(
+                "TELEMETRY_CHECKPOINT_PATH",
+                f"{self.database_path}.audit-checkpoint.json",
+            )
+
+        self.checkpoint_path = Path(checkpoint_path)
+
         self.database_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        self.checkpoint_path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
 
         self._initialize_database()
+        self._initialize_checkpoint()
+
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -77,6 +102,119 @@ class SQLiteTelemetryStore:
                 ON telemetry_events(event_id)
                 """
             )
+
+    def _get_chain_head(self) -> dict:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT sequence_id, record_hash
+                FROM telemetry_events
+                ORDER BY sequence_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+        if row is None:
+            return {
+                "sequence_id": 0,
+                "record_hash": self.GENESIS_HASH,
+            }
+
+        return {
+            "sequence_id": row["sequence_id"],
+            "record_hash": row["record_hash"],
+        }
+
+    def _write_checkpoint(self, chain_head: dict) -> None:
+        checkpoint = {
+            "format_version": 1,
+            "sequence_id": chain_head["sequence_id"],
+            "record_hash": chain_head["record_hash"],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        temporary_path = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.checkpoint_path.parent,
+                prefix=f".{self.checkpoint_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+
+                json.dump(
+                    checkpoint,
+                    temporary_file,
+                    indent=2,
+                )
+                temporary_file.write("\n")
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+
+            os.replace(
+                temporary_path,
+                self.checkpoint_path,
+            )
+
+        finally:
+            if (
+                temporary_path is not None
+                and temporary_path.exists()
+            ):
+                temporary_path.unlink()
+
+    def _read_checkpoint(self) -> dict | None:
+        try:
+            with self.checkpoint_path.open(
+                "r",
+                encoding="utf-8",
+            ) as checkpoint_file:
+                checkpoint = json.load(checkpoint_file)
+
+        except FileNotFoundError:
+            return None
+
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Checkpoint file is unreadable or malformed"
+            ) from exc
+
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Checkpoint must contain a JSON object")
+
+        if checkpoint.get("format_version") != 1:
+            raise ValueError("Unsupported checkpoint format version")
+
+        sequence_id = checkpoint.get("sequence_id")
+        record_hash = checkpoint.get("record_hash")
+
+        if type(sequence_id) is not int or sequence_id < 0:
+            raise ValueError("Checkpoint sequence_id is invalid")
+
+        if (
+            not isinstance(record_hash, str)
+            or len(record_hash) != 64
+            or any(character not in "0123456789abcdef" for character in record_hash)
+        ):
+            raise ValueError("Checkpoint record_hash is invalid")
+
+        return checkpoint
+
+    def _initialize_checkpoint(self) -> None:
+        if self.checkpoint_path.exists():
+            return
+
+        chain_head = self._get_chain_head()
+
+        # Only a genuinely empty database can safely start at genesis.
+        # A non-empty database without a checkpoint needs explicit trust
+        # establishment; never silently adopt its current head.
+        if chain_head["sequence_id"] == 0:
+            self._write_checkpoint(chain_head)
 
     @staticmethod
     def _canonical_json(data: dict) -> str:
@@ -125,6 +263,15 @@ class SQLiteTelemetryStore:
 
                 raise EventConflictError(
                     "Event ID already exists with different content"
+                )
+
+            integrity = self.verify_chain()
+
+            if not integrity["valid"]:
+                raise CheckpointError(
+                    "Telemetry ingestion blocked because audit integrity "
+                    "verification failed: "
+                    + "; ".join(integrity["errors"])
                 )
 
             latest = connection.execute(
@@ -180,7 +327,31 @@ class SQLiteTelemetryStore:
                 ),
             )
 
-            connection.commit()
+            # Update the checkpoint while BEGIN IMMEDIATE still holds
+            # the SQLite writer lock. This prevents another writer from
+            # observing a database head ahead of the checkpoint.
+            try:
+                self._write_checkpoint(
+                    {
+                        "sequence_id": sequence_id,
+                        "record_hash": record_hash,
+                    }
+                )
+            except Exception as exc:
+                raise CheckpointError(
+                    "Could not update the audit checkpoint. "
+                    "The SQLite transaction was rolled back."
+                ) from exc
+
+            try:
+                connection.commit()
+            except Exception as exc:
+                raise CheckpointError(
+                    "The audit checkpoint was updated, but the SQLite "
+                    "commit failed. Verify integrity and explicitly recover "
+                    "the checkpoint if necessary."
+                ) from exc
+
             return IngestionResult.ACCEPTED
 
         except Exception:
@@ -236,7 +407,7 @@ class SQLiteTelemetryStore:
             row["payload_json"]
         )
 
-    def verify_chain(self) -> dict:
+    def _verify_hash_chain(self) -> dict:
         errors = []
 
         with closing(self._connect()) as connection:
@@ -282,8 +453,110 @@ class SQLiteTelemetryStore:
 
             expected_previous_hash = row["record_hash"]
 
+        chain_head = (
+            {
+                "sequence_id": rows[-1]["sequence_id"],
+                "record_hash": rows[-1]["record_hash"],
+            }
+            if rows
+            else {
+                "sequence_id": 0,
+                "record_hash": self.GENESIS_HASH,
+            }
+        )
+
         return {
             "valid": len(errors) == 0,
             "records_checked": len(rows),
             "errors": errors,
+            "chain_head": chain_head,
+        }
+
+    def establish_checkpoint(self) -> dict:
+        """Explicitly trust the current head of a verified hash chain."""
+        connection = self._connect()
+
+        try:
+            # Prevent concurrent ingestion while verifying and writing
+            # the replacement checkpoint.
+            connection.execute("BEGIN IMMEDIATE")
+
+            chain_result = self._verify_hash_chain()
+
+            if not chain_result["valid"]:
+                raise CheckpointError(
+                    "Cannot establish checkpoint because the hash chain "
+                    "is invalid: "
+                    + "; ".join(chain_result["errors"])
+                )
+
+            chain_head = chain_result["chain_head"]
+
+            try:
+                self._write_checkpoint(chain_head)
+            except OSError as exc:
+                raise CheckpointError(
+                    "Could not write the audit checkpoint"
+                ) from exc
+
+            connection.commit()
+
+            return {
+                "established": True,
+                "sequence_id": chain_head["sequence_id"],
+                "record_hash": chain_head["record_hash"],
+            }
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        finally:
+            connection.close()
+
+    def verify_chain(self) -> dict:
+        chain_result = self._verify_hash_chain()
+        errors = list(chain_result["errors"])
+        chain_head = chain_result["chain_head"]
+
+        checkpoint_status = {
+            "present": False,
+            "valid": False,
+            "sequence_id": None,
+            "record_hash": None,
+        }
+
+        try:
+            checkpoint = self._read_checkpoint()
+
+            if checkpoint is None:
+                errors.append(
+                    "Checkpoint is missing; explicit trust establishment required"
+                )
+            else:
+                checkpoint_status = {
+                    "present": True,
+                    "valid": False,
+                    "sequence_id": checkpoint["sequence_id"],
+                    "record_hash": checkpoint["record_hash"],
+                }
+
+                if (
+                    checkpoint["sequence_id"] != chain_head["sequence_id"]
+                    or checkpoint["record_hash"] != chain_head["record_hash"]
+                ):
+                    errors.append(
+                        "Checkpoint does not match the current database head"
+                    )
+                elif chain_result["valid"]:
+                    checkpoint_status["valid"] = True
+
+        except ValueError as exc:
+            errors.append(str(exc))
+
+        return {
+            "valid": len(errors) == 0,
+            "records_checked": chain_result["records_checked"],
+            "errors": errors,
+            "checkpoint": checkpoint_status,
         }

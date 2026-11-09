@@ -6,6 +6,7 @@ import pytest
 
 from app.schemas.telemetry import SensorStatus, TelemetryReading
 from app.services.sqlite_store import (
+    CheckpointError,
     EventConflictError,
     IngestionResult,
     SQLiteTelemetryStore,
@@ -170,7 +171,7 @@ def test_deleting_middle_record_is_detected(store):
     assert any("Previous-hash mismatch" in error for error in result["errors"])
 
 
-def test_deleting_final_record_is_not_detected_without_checkpoint(store):
+def test_deleting_final_record_is_detected_by_checkpoint(store):
     readings = [make_reading() for _ in range(3)]
     for reading in readings:
         store.ingest(reading)
@@ -183,8 +184,12 @@ def test_deleting_final_record_is_not_detected_without_checkpoint(store):
 
     result = store.verify_chain()
 
-    assert result["valid"] is True
+    assert result["valid"] is False
     assert result["records_checked"] == 2
+    assert any(
+        "Checkpoint does not match" in error
+        for error in result["errors"]
+    )
 
 
 def test_empty_audit_chain_is_valid(store):
@@ -209,3 +214,146 @@ def test_received_at_tampering_is_detected(store):
 
     assert result["valid"] is False
     assert any("Record hash mismatch" in error for error in result["errors"])
+
+
+def test_new_empty_store_creates_genesis_checkpoint(tmp_path):
+    store = SQLiteTelemetryStore(tmp_path / "genesis.db")
+
+    result = store.verify_chain()
+
+    assert result["valid"] is True
+    assert result["checkpoint"]["present"] is True
+    assert result["checkpoint"]["valid"] is True
+    assert result["checkpoint"]["sequence_id"] == 0
+
+
+def test_checkpoint_updates_after_ingestion(store):
+    store.ingest(make_reading())
+
+    result = store.verify_chain()
+
+    assert result["valid"] is True
+    assert result["checkpoint"]["sequence_id"] == 1
+    assert result["checkpoint"]["valid"] is True
+
+
+def test_checkpoint_survives_store_recreation(tmp_path):
+    database_path = tmp_path / "persistent_checkpoint.db"
+
+    first_store = SQLiteTelemetryStore(database_path)
+    first_store.ingest(make_reading())
+
+    second_store = SQLiteTelemetryStore(database_path)
+    result = second_store.verify_chain()
+
+    assert result["valid"] is True
+    assert result["checkpoint"]["present"] is True
+    assert result["checkpoint"]["sequence_id"] == 1
+
+
+def test_missing_checkpoint_is_not_automatically_recreated(tmp_path):
+    database_path = tmp_path / "missing_checkpoint.db"
+    first_store = SQLiteTelemetryStore(database_path)
+    first_store.ingest(make_reading())
+
+    first_store.checkpoint_path.unlink()
+
+    second_store = SQLiteTelemetryStore(database_path)
+    result = second_store.verify_chain()
+
+    assert result["valid"] is False
+    assert result["checkpoint"]["present"] is False
+    assert any("Checkpoint is missing" in error for error in result["errors"])
+
+    with pytest.raises(CheckpointError):
+        second_store.ingest(make_reading())
+
+    assert second_store.get_count() == 1
+
+
+def test_malformed_checkpoint_is_reported(store):
+    store.ingest(make_reading())
+    store.checkpoint_path.write_text("{invalid json", encoding="utf-8")
+
+    result = store.verify_chain()
+
+    assert result["valid"] is False
+    assert any("checkpoint" in error.lower() for error in result["errors"])
+
+
+def test_checkpoint_mismatch_blocks_ingestion(store):
+    store.ingest(make_reading())
+
+    store.checkpoint_path.write_text(
+        """
+        {
+            "format_version": 1,
+            "sequence_id": 0,
+            "record_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "updated_at": "2026-11-09T00:00:00+00:00"
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CheckpointError):
+        store.ingest(make_reading())
+
+    assert store.get_count() == 1
+
+
+def test_explicit_checkpoint_establishment_recovers_missing_checkpoint(store):
+    store.ingest(make_reading())
+    store.checkpoint_path.unlink()
+
+    with pytest.raises(CheckpointError):
+        store.ingest(make_reading())
+
+    recovery = store.establish_checkpoint()
+
+    assert recovery["established"] is True
+    assert recovery["sequence_id"] == 1
+    assert store.verify_chain()["valid"] is True
+
+
+def test_invalid_hash_chain_cannot_be_checkpointed(store):
+    reading = make_reading()
+    store.ingest(reading)
+
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE telemetry_events
+            SET payload_json = ?
+            WHERE event_id = ?
+            """,
+            ('{"tampered":true}', str(reading.event_id)),
+        )
+
+    store.checkpoint_path.unlink()
+
+    with pytest.raises(CheckpointError, match="hash chain is invalid"):
+        store.establish_checkpoint()
+
+
+def test_checkpoint_write_failure_rolls_back_ingestion(
+    store,
+    monkeypatch,
+):
+    reading = make_reading()
+    original_checkpoint = store.checkpoint_path.read_bytes()
+
+    def fail_checkpoint(_chain_head):
+        raise OSError("Simulated checkpoint write failure")
+
+    monkeypatch.setattr(store, "_write_checkpoint", fail_checkpoint)
+
+    with pytest.raises(
+        CheckpointError,
+        match="SQLite transaction was rolled back",
+    ):
+        store.ingest(reading)
+
+    assert store.get_count() == 0
+    assert store.checkpoint_path.read_bytes() == original_checkpoint
+    assert store.verify_chain()["valid"] is True

@@ -141,7 +141,7 @@ Interactive documentation: `http://127.0.0.1:8000/docs`.
 
     python -m pytest -v
 
-The current test suite contains 29 tests covering hazard detection, SQLite persistence, audit-chain integrity, and API integration.
+The current test suite contains 46 tests covering hazard detection, SQLite persistence, audit-chain integrity, and API integration.
 
 ## Database and Audit Integrity
 
@@ -153,7 +153,15 @@ A custom location can be configured using the `TELEMETRY_DATABASE_PATH` environm
 
 Each stored telemetry event is associated with a SHA-256 record hash and the preceding record's hash. Verification recalculates record hashes and checks sequence and linkage consistency.
 
-This provides tamper evidence, not absolute tamper prevention. An actor with sufficient access could rewrite the entire database and recompute the chain. Independently stored checkpoints, external signatures, and access controls would be needed for stronger audit guarantees.
+The application also maintains a local JSON audit-checkpoint sidecar containing the latest sequence number and record hash. The default path is the database filename followed by `.audit-checkpoint.json`; a custom path can be configured using `TELEMETRY_CHECKPOINT_PATH`.
+
+A new empty database receives a genesis checkpoint. A non-empty database with a missing checkpoint requires explicit trust establishment through `establish_checkpoint()`; it is never silently adopted.
+
+The checkpoint is updated before the SQLite transaction commits, while the SQLite writer lock is held. If the database and checkpoint become inconsistent, integrity verification fails closed and ingestion is blocked until explicit checkpoint recovery.
+
+The checkpoint is a separate local file, not an external trust anchor. An actor with sufficient access to both files could rewrite the database and checkpoint. Stronger audit guarantees require separately controlled remote or immutable checkpoint storage, signatures, and access controls.
+
+
 
 Local database files are excluded from Git.
 
@@ -165,7 +173,7 @@ Local database files are excluded from Git.
 | `tests/test_sqlite_store.py` | Persistence, duplicate handling, conflicts, and hash-chain integrity |
 | `tests/test_api.py` | API ingestion, retrieval, assessment, integrity, and persistence |
 
-Latest previously verified result: **29 tests passed**. The suite will be rerun before the next commit.
+Latest verified result: **46 tests passed**. The suite will be rerun before the next commit.
 
 ## Current Limitations
 
@@ -213,4 +221,4 @@ Latest previously verified result: **29 tests passed**. The suite will be rerun 
 
 ---
 
-**Project status:** Phase 1 — telemetry ingestion; Phase 2 — explainable hazard detection; Phase 3 — SQLite persistence and hash-chained audit logging.
+**Project status:** Phase 1 — telemetry ingestion; Phase 2 — explainable hazard detection; Phase 3 — SQLite persistence and hash-chained audit logging; Phase 4 — database-level pagination; Phase 5 — audit-chain integrity edge-case tests; Phase 6 — local audit-checkpoint sidecar and explicit recovery.

@@ -20,3 +20,6 @@ dist/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+
+# Local audit checkpoint sidecars
+data/*.audit-checkpoint.json
